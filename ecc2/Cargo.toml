@@ -20,15 +20,15 @@ crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
 
 # State store
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 
 # Git integration
-git2 = { version = "0.20", features = ["ssh"] }
+git2 = { version = "0.21", features = ["ssh"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 regex = "1"
 sha2 = "0.11"
 ureq = { version = "3", features = ["json"] }
@@ -47,13 +47,13 @@ libc = "0.2"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
-cron = "0.12"
+cron = "0.17"
 
 # UUID for session IDs
 uuid = { version = "1", features = ["v4"] }
 
 # Directory paths
-dirs = "6"
+dirs = "7"
 
 [profile.release]
 lto = true

@@ -1,10 +1,10 @@
-# The Longform Guide to Everything Claude Code
+# The Longform Guide to ECC
 
-![Header: The Longform Guide to Everything Claude Code](./assets/images/longform/01-header.png)
+![Header: The Longform Guide to ECC](./assets/images/longform/01-header.png)
 
 ---
 
-> **Prerequisite**: This guide builds on [The Shorthand Guide to Everything Claude Code](./the-shortform-guide.md). Read that first if you haven't set up skills, hooks, subagents, MCPs, and plugins.
+> **Prerequisite**: This guide builds on [The Shorthand Guide to ECC](./the-shortform-guide.md). Read that first if you haven't set up skills, hooks, subagents, MCPs, and plugins.
 
 ![Reference to Shorthand Guide](./assets/images/longform/02-shortform-reference.png)
 *The Shorthand Guide - read it first*
@@ -15,7 +15,7 @@ This longform guide goes into the techniques that separate productive sessions f
 
 The themes here: token economics, memory persistence, verification patterns, parallelization strategies, and the compound effects of building reusable workflows. These are the patterns I've refined over 10+ months of daily use that make the difference between being plagued by context rot within the first hour, versus maintaining productive sessions for hours.
 
-Everything covered in the shorthand and longform guides is available on GitHub: `github.com/affaan-m/everything-claude-code`
+Everything covered in the shorthand and longform guides is available on GitHub: `github.com/affaan-m/ECC`
 
 ---
 
@@ -40,7 +40,7 @@ With lazy loading, the context window issue is mostly solved. But token usage an
 For sharing memory across sessions, a skill or command that summarizes and checks in on progress then saves to a `.tmp` file in your `.claude` folder and appends to it until the end of your session is the best bet. The next day it can use that as context and pick up where you left off, create a new file for each session so you don't pollute old context into new work.
 
 ![Session Storage File Tree](./assets/images/longform/03-session-storage.png)
-*Example of session storage -> <https://github.com/affaan-m/everything-claude-code/tree/main/examples/sessions>*
+*Example of session storage -> <https://github.com/affaan-m/ECC/blob/main/commands/save-session.md#session-file-format>*
 
 Claude creates a file summarizing current state. Review it, ask for edits if needed, then start fresh. For the new conversation, just provide the file path. Particularly useful when you're hitting context limits and need to continue complex work. These files should contain:
 - What approaches worked (verifiably with evidence)
@@ -56,8 +56,10 @@ Once you have your plan set and context cleared (default option in plan mode in 
 One pattern I picked up: instead of solely putting everything in CLAUDE.md (user scope) or `.claude/rules/` (project scope) which loads every session, use CLI flags to inject context dynamically.
 
 ```bash
-claude --system-prompt "$(cat memory.md)"
+claude --append-system-prompt-file memory.md
 ```
+
+> Use `--append-system-prompt-file` (or `--append-system-prompt`), not `--system-prompt`. The `--system-prompt` flags replace Claude Code's entire default prompt, including its tool-use instructions.
 
 This lets you be more surgical about what context loads when. System prompt content has higher authority than user messages, which have higher authority than tool results.
 
@@ -65,13 +67,13 @@ This lets you be more surgical about what context loads when. System prompt cont
 
 ```bash
 # Daily development
-alias claude-dev='claude --system-prompt "$(cat ~/.claude/contexts/dev.md)"'
+alias claude-dev='claude --append-system-prompt-file ~/.claude/contexts/dev.md'
 
 # PR review mode
-alias claude-review='claude --system-prompt "$(cat ~/.claude/contexts/review.md)"'
+alias claude-review='claude --append-system-prompt-file ~/.claude/contexts/review.md'
 
 # Research/exploration mode
-alias claude-research='claude --system-prompt "$(cat ~/.claude/contexts/research.md)"'
+alias claude-research='claude --append-system-prompt-file ~/.claude/contexts/research.md'
 ```
 
 **Advanced: Memory Persistence Hooks**
@@ -82,7 +84,7 @@ There are hooks most people don't know about that help with memory:
 - **Stop Hook (Session End)**: On session end, persist learnings to a file
 - **SessionStart Hook**: On new session, load previous context automatically
 
-I've built these hooks and they're in the repo at `github.com/affaan-m/everything-claude-code/tree/main/hooks/memory-persistence`
+I've built these hooks and they're in the repo at `github.com/affaan-m/ECC/tree/main/hooks/memory-persistence`
 
 ---
 
@@ -94,7 +96,7 @@ If you've had to repeat a prompt multiple times and Claude ran into the same pro
 
 **The Solution:** When Claude Code discovers something that isn't trivial - a debugging technique, a workaround, some project-specific pattern - it saves that knowledge as a new skill. Next time a similar problem comes up, the skill gets loaded automatically.
 
-I've built a continuous learning skill that does this: `github.com/affaan-m/everything-claude-code/tree/main/skills/continuous-learning`
+I've built a continuous learning skill that does this: `github.com/affaan-m/ECC/tree/main/skills/continuous-learning`
 
 **Why Stop Hook (Not UserPromptSubmit):**
 
@@ -351,4 +353,4 @@ alias q='cd ~/Desktop/projects'
 
 ---
 
-*Everything covered in both guides is available on GitHub at [everything-claude-code](https://github.com/affaan-m/everything-claude-code)*
+*Everything covered in both guides is available on GitHub at [ECC](https://github.com/affaan-m/ECC)*

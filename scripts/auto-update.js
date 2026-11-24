@@ -6,6 +6,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const { discoverInstalledStates } = require('./lib/install-lifecycle');
+const { getRecordedHookConsent } = require('./lib/install/hook-consent');
 const { SUPPORTED_INSTALL_TARGETS } = require('./lib/install-manifests');
 
 function showHelp(exitCode = 0) {
@@ -25,7 +26,7 @@ function parseArgs(argv) {
     repoRoot: null,
     dryRun: false,
     json: false,
-    help: false,
+    help: false
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -48,7 +49,11 @@ function parseArgs(argv) {
     }
   }
 
-  return parsed;
+  const dryRunEnv = process.env.ECC_DRY_RUN;
+  if (dryRunEnv !== undefined && dryRunEnv !== '0' && dryRunEnv !== '1') {
+    throw new Error('ECC_DRY_RUN must be "1" or "0" when set');
+  }
+  return { ...parsed, dryRun: parsed.dryRun || dryRunEnv === '1' };
 }
 
 function deriveRepoRootFromState(state) {
@@ -63,9 +68,7 @@ function deriveRepoRootFromState(state) {
       continue;
     }
 
-    const relativeParts = operation.sourceRelativePath
-      .split(/[\\/]+/)
-      .filter(Boolean);
+    const relativeParts = operation.sourceRelativePath.split(/[\\/]+/).filter(Boolean);
 
     if (relativeParts.length === 0) {
       continue;
@@ -87,6 +90,7 @@ function buildInstallApplyArgs(record) {
   const target = state.target.target || record.adapter.target;
   const request = state.request || {};
   const args = [];
+  const hookConsent = getRecordedHookConsent(state);
 
   if (target) {
     args.push('--target', target);
@@ -108,6 +112,12 @@ function buildInstallApplyArgs(record) {
     args.push('--without', componentId);
   }
 
+  if (hookConsent === 'enabled') {
+    args.push('--enable-hooks');
+  } else if (hookConsent === 'declined') {
+    args.push('--no-hooks');
+  }
+
   for (const language of Array.isArray(request.legacyLanguages) ? request.legacyLanguages : []) {
     args.push(language);
   }
@@ -123,6 +133,13 @@ function determineInstallCwd(record, repoRoot) {
   return repoRoot;
 }
 
+// Recognized ECC package names. A repo root is only trusted to run its
+// install-apply.js if its package.json identifies it as ECC — otherwise a
+// cloned project that ships a nested `evil/{package.json,scripts/install-apply.js}`
+// could drive auto-update into executing attacker code (GHSA-hfpv-w6mp-5g95).
+// 'everything-claude-code' is the legacy 1.x package name, kept for existing checkouts.
+const ECC_PACKAGE_NAMES = new Set(['ecc-universal', 'everything-claude-code']);
+
 function validateRepoRoot(repoRoot) {
   const normalized = path.resolve(repoRoot);
   const packageJsonPath = path.join(normalized, 'package.json');
@@ -136,6 +153,16 @@ function validateRepoRoot(repoRoot) {
     throw new Error(`Invalid ECC repo root: missing install script at ${installApplyPath}`);
   }
 
+  let pkgName = null;
+  try {
+    pkgName = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')).name;
+  } catch {
+    throw new Error(`Invalid ECC repo root: unreadable package.json at ${packageJsonPath}`);
+  }
+  if (!ECC_PACKAGE_NAMES.has(pkgName)) {
+    throw new Error(`Refusing to run install from untrusted repo root ${normalized}: package.json name '${pkgName}' is not an official ECC package.`);
+  }
+
   return normalized;
 }
 
@@ -144,19 +171,27 @@ function runExternalCommand(command, args, options = {}) {
     cwd: options.cwd,
     env: options.env || process.env,
     encoding: 'utf8',
-    maxBuffer: 10 * 1024 * 1024,
+    maxBuffer: 10 * 1024 * 1024
   });
 
   if (result.error) {
     throw result.error;
   }
 
-  if (typeof result.status === 'number' && result.status !== 0) {
+  if (result.status !== 0) {
     const errorOutput = (result.stderr || result.stdout || '').trim();
-    throw new Error(`${command} ${args.join(' ')} failed${errorOutput ? `: ${errorOutput}` : ''}`);
+    const failure = result.signal ? `was terminated by ${result.signal}` : 'failed';
+    throw new Error(`${command} ${args.join(' ')} ${failure}${errorOutput ? `: ${errorOutput}` : ''}`);
   }
 
   return result;
+}
+
+function legacyMigrationWarning(record) {
+  if (record.legacyLayout === 'opencode') {
+    return 'Found only a legacy OpenCode ~/.opencode install-state. Run the OpenCode installer once to migrate it to the configured OpenCode directory before auto-updating.';
+  }
+  return 'Found only a legacy Antigravity .agent install-state. Run the Antigravity installer once to migrate it to .agents before auto-updating.';
 }
 
 function runAutoUpdate(options = {}, dependencies = {}) {
@@ -165,11 +200,16 @@ function runAutoUpdate(options = {}, dependencies = {}) {
   const homeDir = options.homeDir || process.env.HOME || os.homedir();
   const projectRoot = options.projectRoot || process.cwd();
   const requestedRepoRoot = options.repoRoot ? validateRepoRoot(options.repoRoot) : null;
-  const records = discover({
+  const discoveredRecords = discover({
     homeDir,
     projectRoot,
-    targets: options.targets,
-  }).filter(record => record.exists);
+    targets: options.targets
+  });
+  const records = discoveredRecords.filter(record => record.exists && !record.legacy);
+  const legacyRecords = discoveredRecords.filter(record => record.exists && record.legacy);
+  const warnings = records.length === 0 && legacyRecords.length > 0
+    ? [...new Set(legacyRecords.map(legacyMigrationWarning))]
+    : [];
 
   const results = [];
   if (records.length === 0) {
@@ -177,11 +217,12 @@ function runAutoUpdate(options = {}, dependencies = {}) {
       dryRun: Boolean(options.dryRun),
       repoRoot: requestedRepoRoot,
       results,
+      warnings,
       summary: {
         checkedCount: 0,
         updatedCount: 0,
-        errorCount: 0,
-      },
+        errorCount: 0
+      }
     };
   }
 
@@ -193,7 +234,7 @@ function runAutoUpdate(options = {}, dependencies = {}) {
         adapter: record.adapter,
         installStatePath: record.installStatePath,
         status: 'error',
-        error: record.error || 'No valid install-state available',
+        error: record.error || 'No valid install-state available'
       });
       continue;
     }
@@ -202,7 +243,7 @@ function runAutoUpdate(options = {}, dependencies = {}) {
     inferredRepoRoots.push(recordRepoRoot);
     validRecords.push({
       record,
-      repoRoot: recordRepoRoot,
+      repoRoot: recordRepoRoot
     });
   }
 
@@ -219,18 +260,19 @@ function runAutoUpdate(options = {}, dependencies = {}) {
       dryRun: Boolean(options.dryRun),
       repoRoot,
       results,
+      warnings,
       summary: {
         checkedCount: results.length,
         updatedCount: 0,
-        errorCount: results.length,
-      },
+        errorCount: results.length
+      }
     };
   }
 
   const env = {
     ...process.env,
     HOME: homeDir,
-    USERPROFILE: homeDir,
+    USERPROFILE: homeDir
   };
 
   if (!options.dryRun) {
@@ -240,11 +282,7 @@ function runAutoUpdate(options = {}, dependencies = {}) {
 
   for (const entry of validRecords) {
     const installArgs = buildInstallApplyArgs(entry.record);
-    const args = [
-      path.join(repoRoot, 'scripts', 'install-apply.js'),
-      ...installArgs,
-      '--json',
-    ];
+    const args = [path.join(repoRoot, 'scripts', 'install-apply.js'), ...installArgs, '--json'];
 
     if (options.dryRun) {
       args.push('--dry-run');
@@ -253,7 +291,7 @@ function runAutoUpdate(options = {}, dependencies = {}) {
     try {
       const commandResult = execute(process.execPath, args, {
         cwd: determineInstallCwd(entry.record, repoRoot),
-        env,
+        env
       });
 
       let payload = null;
@@ -268,7 +306,7 @@ function runAutoUpdate(options = {}, dependencies = {}) {
         cwd: determineInstallCwd(entry.record, repoRoot),
         installArgs,
         status: options.dryRun ? 'planned' : 'updated',
-        payload,
+        payload
       });
     } catch (error) {
       results.push({
@@ -277,7 +315,7 @@ function runAutoUpdate(options = {}, dependencies = {}) {
         repoRoot,
         installArgs,
         status: 'error',
-        error: error.message,
+        error: error.message
       });
     }
   }
@@ -286,17 +324,24 @@ function runAutoUpdate(options = {}, dependencies = {}) {
     dryRun: Boolean(options.dryRun),
     repoRoot,
     results,
+    warnings,
     summary: {
       checkedCount: results.length,
       updatedCount: results.filter(result => result.status === 'updated' || result.status === 'planned').length,
-      errorCount: results.filter(result => result.status === 'error').length,
-    },
+      errorCount: results.filter(result => result.status === 'error').length
+    }
   };
 }
 
 function printHuman(result) {
   if (result.results.length === 0) {
-    console.log('No ECC install-state files found for the current home/project context.');
+    const hasWarnings = Array.isArray(result.warnings) && result.warnings.length > 0;
+    console.log(hasWarnings
+      ? 'No active ECC install-state files found for the current home/project context.'
+      : 'No ECC install-state files found for the current home/project context.');
+    for (const warning of Array.isArray(result.warnings) ? result.warnings : []) {
+      console.log(`Warning: ${warning}`);
+    }
     return;
   }
 
@@ -332,7 +377,7 @@ function main() {
       projectRoot: process.cwd(),
       targets: options.targets,
       repoRoot: options.repoRoot,
-      dryRun: options.dryRun,
+      dryRun: options.dryRun
     });
 
     if (options.json) {
@@ -357,5 +402,5 @@ module.exports = {
   deriveRepoRootFromState,
   buildInstallApplyArgs,
   determineInstallCwd,
-  runAutoUpdate,
+  runAutoUpdate
 };

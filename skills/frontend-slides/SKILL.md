@@ -1,7 +1,8 @@
 ---
 name: frontend-slides
 description: Create stunning, animation-rich HTML presentations from scratch or by converting PowerPoint files. Use when the user wants to build a presentation, convert a PPT/PPTX to web, or create slides for a talk/pitch. Helps non-designers discover their aesthetic through visual exploration rather than abstract choices.
-origin: ECC
+metadata:
+  origin: ECC
 ---
 
 # Frontend Slides
@@ -40,8 +41,14 @@ Choose one path:
 
 Ask only the minimum needed:
 - purpose: pitch, teaching, conference talk, internal update
-- length: short (5-10), medium (10-20), long (20+)
+- length: short (5-10), medium (10-20), long (20+), or single-slide / one-pager (1)
 - content state: finished copy, rough notes, topic only
+
+> [!IMPORTANT]
+> **Make the requested slide count explicit:**
+> When the user supplies a count (for example, "one slide" or "one-pager"), honor it and state the deliverable size before building. Ask one short clarification only when the requested count is ambiguous; "everything about X" alone does not imply one slide.
+> State an explicit count in one short line before building:
+> *"Confirming deliverable size: 1-slide architecture overview (one-pager). Proceeding with container-scaled density grid."*
 
 If the user has content, ask them to paste it before styling.
 

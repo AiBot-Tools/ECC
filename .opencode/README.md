@@ -44,7 +44,7 @@ It does **not** auto-register the full ECC command/agent/instruction catalog in 
 After installation, the `ecc-install` CLI is also available:
 
 ```bash
-npx ecc-install typescript
+npx ecc-universal install typescript
 ```
 
 ### Option 2: Direct Use
@@ -72,10 +72,11 @@ a pointer to this command if the build step is missing.
 
 ## Features
 
-### Agents (12)
+### Agents (26)
 
 | Agent | Description |
 |-------|-------------|
+| build | Primary coding agent for development work |
 | planner | Implementation planning |
 | architect | System design |
 | code-reviewer | Code review |
@@ -88,8 +89,21 @@ a pointer to this command if the build step is missing.
 | go-reviewer | Go code review |
 | go-build-resolver | Go build errors |
 | database-reviewer | Database optimization |
+| docs-lookup | Documentation lookup via Context7 |
+| harness-optimizer | Harness config tuning |
+| java-reviewer | Java code review |
+| java-build-resolver | Java build errors |
+| kotlin-reviewer | Kotlin code review |
+| kotlin-build-resolver | Kotlin build errors |
+| loop-operator | Autonomous loop execution |
+| php-reviewer | PHP code review |
+| python-reviewer | Python code review |
+| rust-reviewer | Rust code review |
+| rust-build-resolver | Rust build errors |
+| cpp-reviewer | C++ code review |
+| cpp-build-resolver | C++ build errors |
 
-### Commands (31)
+### Commands (26)
 
 | Command | Description |
 |---------|-------------|
@@ -119,11 +133,6 @@ a pointer to this command if the build step is missing.
 | `/evolve` | Cluster instincts |
 | `/promote` | Promote project instincts |
 | `/projects` | List known projects |
-| `/harness-audit` | Audit harness reliability and eval readiness |
-| `/loop-start` | Start controlled agentic loops |
-| `/loop-status` | Check loop state and checkpoints |
-| `/quality-gate` | Run quality gates on file/repo scope |
-| `/model-route` | Route tasks by model and budget |
 
 ### Plugin Hooks
 
@@ -132,8 +141,23 @@ a pointer to this command if the build step is missing.
 | Prettier | `file.edited` | Auto-format JS/TS |
 | TypeScript | `tool.execute.after` | Check for type errors |
 | console.log | `file.edited` | Warn about debug statements |
-| Notification | `session.idle` | Desktop notification |
-| Security | `tool.execute.before` | Check for secrets |
+| Notification | `session.idle` | Desktop notification (cross-platform) |
+| Tool reminders | `tool.execute.before` | Track writes and suggest review before pushing |
+| Git Push Reminder | `tool.execute.before` | Remind to review before pushing |
+| Doc File Warning | `tool.execute.before` | Warn about unnecessary documentation |
+| Long Command Reminder | `tool.execute.before` | Remind about long-running commands |
+| Session Context | `session.created` | Load project context |
+| Console Log Audit | `session.idle` | Audit edited files for console.log |
+| File Watcher | `file.watcher.updated` | Track file system changes |
+| Todo Progress | `todo.updated` | Log task completion progress |
+| Shell Environment | `shell.env` | Inject environment variables |
+| Session Compacting | `experimental.session.compacting` | Preserve context across compaction |
+| Permission Auto-Approve | `permission.ask` | Auto-approve safe operations |
+
+The tool-before callbacks provide bookkeeping and advisory reminders. They do
+not run ECC's canonical Bash guards or reject commands such as
+`git commit --no-verify`. Native OpenCode permission rules remain the execution
+boundary; configured native denies take precedence over ECC read suggestions.
 
 ### Custom Tools
 
@@ -142,6 +166,11 @@ a pointer to this command if the build step is missing.
 | run-tests | Run test suite with options |
 | check-coverage | Analyze test coverage |
 | security-audit | Security vulnerability scan |
+| format-code | Detect formatter and return command |
+| lint-check | Detect linter and return command |
+| git-summary | Generate git summary with branch, status, and diff |
+| changed-files | List files changed in session as a navigable tree |
+| dependency-analyzer | Analyze dependencies for outdated, vulnerable, and unused packages |
 
 ## Hook Event Mapping
 
@@ -200,9 +229,6 @@ Full configuration in `opencode.json`:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "anthropic/claude-sonnet-4-5",
-  "small_model": "anthropic/claude-haiku-4-5",
-  "plugin": ["./plugins"],
   "instructions": [
     "skills/tdd-workflow/SKILL.md",
     "skills/security-review/SKILL.md"
@@ -212,6 +238,27 @@ Full configuration in `opencode.json`:
 }
 ```
 
+The reference config intentionally leaves model selection to OpenCode. Connect a
+provider and select a model in OpenCode; ECC's primary agent uses that global
+selection, and its subagents inherit the invoking primary agent's model.
+
 ## License
 
 MIT
+
+Home-target installations keep `plugins/index.ts` inert even with hooks enabled.
+The default plugin entry targets OpenCode 2.x. OpenCode 1.x's function-only
+loader cannot load this entry; the retained named V1 factory is a migration
+surface, not automatic V1 package compatibility.
+
+OpenCode 2.x loads plugins by scanning every root-level file in a plugins
+directory; it does **not** accept configured file paths — an entry like
+`"./plugins/ecc-hooks.ts"` in the `plugin` array logs
+"configured plugin path must be a directory" and is skipped, so the config ships
+without any `plugin` entry and `plugins/ecc-hooks.ts` is discovered from the
+directory. The barrel stays a distinct-id stub (`ecc-hooks-entry`) because
+re-exporting the real definition from `index.ts` would register the id
+`ecc-hooks` twice — once per discovered entry — and OpenCode marks every entry
+after the first as failed (`Duplicate plugin ID`). The source and published
+package barrel remain available for module imports; the package `./plugins`
+subpath maps to the live `dist/plugins/ecc-hooks.js` entry point.

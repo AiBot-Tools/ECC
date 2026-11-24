@@ -11,6 +11,13 @@ const { spawnSync } = require('child_process');
 const preDispatcher = path.join(__dirname, '..', '..', 'scripts', 'hooks', 'pre-bash-dispatcher.js');
 const postDispatcher = path.join(__dirname, '..', '..', 'scripts', 'hooks', 'post-bash-dispatcher.js');
 
+// The post-Bash dispatcher appends to ~/.claude/bash-commands.log and
+// ~/.claude/cost-tracker.log, so runs get an empty home instead of the
+// developer's real one unless a test passes its own HOME.
+const ISOLATED_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-bash-dispatcher-home-'));
+const ISOLATED_HOME_ENV = { HOME: ISOLATED_HOME, USERPROFILE: ISOLATED_HOME };
+process.on('exit', () => fs.rmSync(ISOLATED_HOME, { recursive: true, force: true }));
+
 function test(name, fn) {
   try {
     fn();
@@ -29,6 +36,7 @@ function runScript(scriptPath, input, env = {}) {
     encoding: 'utf8',
     env: {
       ...process.env,
+      ...ISOLATED_HOME_ENV,
       ...env,
     },
     timeout: 10000,
@@ -53,6 +61,59 @@ function runTests() {
     assert.strictEqual(result.stdout, '', 'Blocking hook should not pass through stdout');
   })) passed++; else failed++;
 
+  if (test('pre dispatcher emits no stdout for a plain command (regression: issue #2239)', () => {
+    // A pass-through command (no sub-hook adds context) must NOT echo the
+    // input event back to stdout — Claude Code validates hook stdout against
+    // the hook-output schema and the input event fails as "(root): Invalid input".
+    const input = { tool_input: { command: 'ls -la' } };
+    const result = runScript(preDispatcher, input, { ECC_HOOK_PROFILE: 'standard' });
+    assert.strictEqual(result.status, 0);
+    assert.strictEqual(result.stdout, '', `Pass-through must emit empty stdout, got: ${result.stdout}`);
+  })) passed++; else failed++;
+
+  if (test('pre dispatcher fails closed when its configured byte cap truncates input', () => {
+    const input = {
+      tool_name: 'Bash',
+      tool_input: { command: `echo ${'x'.repeat(256)}` }
+    };
+    const result = runScript(preDispatcher, input, {
+      ECC_HOOK_PROFILE: 'standard',
+      ECC_HOOK_INPUT_MAX_BYTES: '64'
+    });
+    assert.strictEqual(result.status, 2, result.stderr);
+    assert.strictEqual(result.stdout, '');
+    assert.match(result.stderr, /safety checks require the complete request/);
+  })) passed++; else failed++;
+
+  if (test('pre dispatcher applies its byte cap at UTF-8 boundaries', () => {
+    const input = {
+      tool_name: 'Bash',
+      tool_input: { command: String.fromCodePoint(0xe9).repeat(64) }
+    };
+    const result = runScript(preDispatcher, input, {
+      ECC_HOOK_PROFILE: 'standard',
+      ECC_HOOK_INPUT_MAX_BYTES: '65'
+    });
+    assert.strictEqual(result.status, 2, result.stderr);
+    assert.strictEqual(result.stdout, '');
+    assert.match(result.stderr, /stdin exceeded 65 bytes/);
+  })) passed++; else failed++;
+
+  if (test('disabled pre dispatcher does not block truncated input', () => {
+    const input = {
+      tool_name: 'Bash',
+      tool_input: { command: `echo ${'x'.repeat(256)}` }
+    };
+    for (const env of [
+      { ECC_HOOK_INPUT_MAX_BYTES: '64', ECC_DISABLED_HOOKS: 'pre:bash:dispatcher' },
+      { ECC_HOOK_INPUT_MAX_BYTES: '64', ECC_HOOKS_ENABLED: 'false' }
+    ]) {
+      const result = runScript(preDispatcher, input, env);
+      assert.strictEqual(result.status, 0, result.stderr);
+      assert.strictEqual(result.stdout, '');
+    }
+  })) passed++; else failed++;
+
   if (test('pre dispatcher still honors per-hook disable flags', () => {
     const input = { tool_input: { command: 'git push origin main' } };
 
@@ -69,8 +130,33 @@ function runTests() {
       ECC_DISABLED_HOOKS: 'pre:bash:git-push-reminder',
     });
     assert.strictEqual(disabled.status, 0);
-    assert.strictEqual(disabled.stdout, JSON.stringify(input), 'Disabled hook should pass through original input');
+    assert.strictEqual(disabled.stdout, '', 'Disabled hook should emit no stdout (echoing the input event fails hook-output schema validation)');
     assert.ok(!disabled.stderr.includes('Review changes before push'), 'Disabled hook should not emit reminder');
+  })) passed++; else failed++;
+
+  if (test('pre dispatcher keeps a GateGuard deny when an advisory hook also adds context', () => {
+    // In the strict profile the git-push reminder adds additionalContext for
+    // every `git push`, and GateGuard denies a force-push with a
+    // permissionDecision on stdout at exit 0. The advisory note must not
+    // replace the denial.
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-bash-dispatcher-gateguard-'));
+    try {
+      const input = {
+        tool_name: 'Bash',
+        session_id: 'dispatcher-deny-precedence',
+        tool_input: { command: 'git push --force origin main' },
+      };
+      const result = runScript(preDispatcher, input, {
+        ECC_HOOK_PROFILE: 'strict',
+        GATEGUARD_STATE_DIR: stateDir,
+      });
+      assert.strictEqual(result.status, 0, result.stderr);
+      const output = parseHookOutput(result.stdout).hookSpecificOutput;
+      assert.strictEqual(output.permissionDecision, 'deny', `Expected GateGuard deny, got: ${result.stdout}`);
+      assert.ok(output.permissionDecisionReason.includes('Destructive command'), 'Expected the GateGuard reason');
+    } finally {
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
   })) passed++; else failed++;
 
   if (test('pre dispatcher respects hook profiles inside the consolidated path', () => {
@@ -78,7 +164,7 @@ function runTests() {
     const result = runScript(preDispatcher, input, { ECC_HOOK_PROFILE: 'minimal' });
     assert.strictEqual(result.status, 0);
     assert.strictEqual(result.stderr, '', 'Strict-only reminders should stay disabled in minimal profile');
-    assert.strictEqual(result.stdout, JSON.stringify(input));
+    assert.strictEqual(result.stdout, '', 'Pass-through must emit no stdout, not echo the input event');
   })) passed++; else failed++;
 
   if (test('post dispatcher writes both bash audit and cost logs in one pass', () => {
@@ -91,7 +177,7 @@ function runTests() {
         USERPROFILE: homeDir,
       });
       assert.strictEqual(result.status, 0);
-      assert.strictEqual(result.stdout, JSON.stringify(payload));
+      assert.strictEqual(result.stdout, '', 'Post dispatcher pass-through must emit no stdout, not echo the input event');
 
       const auditLog = fs.readFileSync(path.join(homeDir, '.claude', 'bash-commands.log'), 'utf8');
       const costLog = fs.readFileSync(path.join(homeDir, '.claude', 'cost-tracker.log'), 'utf8');

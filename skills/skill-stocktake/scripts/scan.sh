@@ -13,6 +13,27 @@
 
 set -euo pipefail
 
+sort_nul_file() {
+  local input_file="$1"
+  local sorted_file="${input_file}.sorted"
+  node -e '
+    const fs = require("fs");
+    const input = fs.readFileSync(0);
+    const records = [];
+    let start = 0;
+    for (let index = 0; index < input.length; index += 1) {
+      if (input[index] === 0) {
+        records.push(input.subarray(start, index + 1));
+        start = index + 1;
+      }
+    }
+    if (start < input.length) records.push(input.subarray(start));
+    records.sort(Buffer.compare);
+    process.stdout.write(Buffer.concat(records));
+  ' <"$input_file" >"$sorted_file"
+  mv "$sorted_file" "$input_file"
+}
+
 GLOBAL_DIR="${SKILL_STOCKTAKE_GLOBAL_DIR:-$HOME/.claude/skills}"
 CWD_SKILLS_DIR="${SKILL_STOCKTAKE_PROJECT_DIR:-${1:-$PWD/.claude/skills}}"
 # Path to JSONL file containing tool-use observations (optional; used for usage frequency counts).
@@ -53,25 +74,28 @@ date_ago() {
   date -u -d "${n} days ago" +%Y-%m-%dT%H:%M:%SZ
 }
 
-# Count observations matching a file path since a cutoff timestamp
-count_obs() {
-  local file="$1" cutoff="$2"
+# Keep paths as JSON keys so characters in filenames never split records.
+aggregate_observations() {
   if [[ ! -f "$OBSERVATIONS" ]]; then
-    echo 0
+    echo null
     return
   fi
-  jq -r --arg p "$file" --arg c "$cutoff" \
-    'select(.tool=="Read" and .path==$p and .timestamp>=$c) | 1' \
-    "$OBSERVATIONS" 2>/dev/null | wc -l | tr -d ' '
+
+  local c7 c30
+  c7=$(date_ago 7)
+  c30=$(date_ago 30)
+  jq -n --arg c7 "$c7" --arg c30 "$c30" '
+    reduce inputs as $event ({};
+      if $event.tool == "Read" and ($event.path | type) == "string" and $event.timestamp >= $c30 then
+        .[$event.path].use_30d += 1
+        | if $event.timestamp >= $c7 then .[$event.path].use_7d += 1 else . end
+      else . end)
+  ' "$OBSERVATIONS"
 }
 
 # Scan a directory and produce a JSON array of skill objects
 scan_dir_to_json() {
   local dir="$1"
-  local c7 c30
-  c7=$(date_ago 7)
-  c30=$(date_ago 30)
-
   local tmpdir
   tmpdir=$(mktemp -d)
   # Use a function to avoid embedding $tmpdir in a quoted string (prevents injection
@@ -80,50 +104,58 @@ scan_dir_to_json() {
   _scan_cleanup() { rm -rf "$_scan_tmpdir"; }
   trap _scan_cleanup RETURN
 
-  # Pre-aggregate observation counts in two passes (one per window) instead of
-  # calling jq per-file — reduces from O(n*m) to O(n+m) jq invocations.
-  local obs_7d_counts obs_30d_counts
-  obs_7d_counts=""
-  obs_30d_counts=""
-  if [[ -f "$OBSERVATIONS" ]]; then
-    obs_7d_counts=$(jq -r --arg c "$c7" \
-      'select(.tool=="Read" and .timestamp>=$c) | .path' \
-      "$OBSERVATIONS" 2>/dev/null | sort | uniq -c)
-    obs_30d_counts=$(jq -r --arg c "$c30" \
-      'select(.tool=="Read" and .timestamp>=$c) | .path' \
-      "$OBSERVATIONS" 2>/dev/null | sort | uniq -c)
-  fi
-
   local i=0
-  while IFS= read -r file; do
-    local name desc mtime u7 u30 dp
+  local find_out="$tmpdir/.find-stdout"
+  local find_err="$tmpdir/.find-stderr"
+  # Capture find's exit status and stderr instead of discarding them: with -L,
+  # a broken symlink or unreadable directory makes find skip that entry AND
+  # exit non-zero, which would otherwise silently under-count skills.
+  # NUL-delimited (-print0 / sort_nul_file / read -d '') so a path containing a
+  # literal newline can't desync record boundaries — paths here are untrusted.
+  # Archived skills are not live inventory; prune the entire trash subtree.
+  if ! find -L "$dir" -type d -name ".trash" -prune -o -name "SKILL.md" -type f -print0 >"$find_out" 2>"$find_err"; then
+    echo "Error: find encountered errors while scanning $dir; refusing an incomplete inventory:" >&2
+    cat "$find_err" >&2
+    return 1
+  fi
+  sort_nul_file "$find_out"
+
+  while IFS= read -r -d '' file; do
+    local name desc mtime dp record_file
     name=$(extract_field "$file" "name")
     desc=$(extract_field "$file" "description")
     mtime=$(date -u -r "$file" +%Y-%m-%dT%H:%M:%SZ)
-    # Use awk exact field match to avoid substring false-positives from grep -F.
-    # uniq -c output format: "   N /path/to/file" — path is always field 2.
-    u7=$(echo "$obs_7d_counts" | awk -v f="$file" '$2 == f {print $1}' | head -1)
-    u7="${u7:-0}"
-    u30=$(echo "$obs_30d_counts" | awk -v f="$file" '$2 == f {print $1}' | head -1)
-    u30="${u30:-0}"
     dp="${file/#$HOME/~}"
 
+    # Zero-pad record names so the "$tmpdir"/*.json glob below keeps the sorted
+    # discovery order past nine records (unpadded, 10.json sorts before 2.json).
+    printf -v record_file '%s/%08d.json' "$tmpdir" "$i"
     jq -n \
       --arg path "$dp" \
       --arg name "$name" \
       --arg description "$desc" \
       --arg mtime "$mtime" \
-      --argjson use_7d "$u7" \
-      --argjson use_30d "$u30" \
-      '{path:$path,name:$name,description:$description,use_7d:$use_7d,use_30d:$use_30d,mtime:$mtime}' \
-      > "$tmpdir/$i.json"
+      --arg observation_path "$file" \
+      '{path:$path,name:$name,description:$description,mtime:$mtime,observation_path:$observation_path}' \
+      > "$record_file"
     i=$((i+1))
-  done < <(find "$dir" -name "*.md" -type f 2>/dev/null | sort)
+  done < "$find_out"
 
   if [[ $i -eq 0 ]]; then
     echo "[]"
   else
-    jq -s '.' "$tmpdir"/*.json
+    local usage_file="$tmpdir/.usage"
+    if ! aggregate_observations >"$usage_file"; then
+      echo "Error: observation aggregation failed; refusing incomplete usage counts" >&2
+      return 1
+    fi
+    jq -s --slurpfile usage "$usage_file" '
+      $usage[0] as $counts |
+      map($counts[.observation_path] as $skill |
+        .use_7d = (if $counts == null then null else ($skill.use_7d // 0) end) |
+        .use_30d = (if $counts == null then null else ($skill.use_30d // 0) end) |
+        del(.observation_path))
+    ' "$tmpdir"/*.json
   fi
 }
 

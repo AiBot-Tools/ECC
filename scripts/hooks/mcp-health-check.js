@@ -13,6 +13,7 @@
  */
 
 const fs = require('fs');
+const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
 const http = require('http');
@@ -28,8 +29,11 @@ const MAX_BACKOFF_MS = 10 * 60 * 1000;
 // Claude Code's stored OAuth bearer token. Treat auth-gated responses as
 // reachable so the real MCP client can attempt the authenticated call. A
 // Streamable HTTP MCP server can also return 406 to a bare GET that omits
-// Accept: text/event-stream; that still proves the endpoint is alive.
-const HEALTHY_HTTP_CODES = new Set([200, 201, 202, 204, 301, 302, 303, 304, 307, 308, 400, 401, 403, 405, 406]);
+// Accept: text/event-stream; that still proves the endpoint is alive. Some
+// POST-only Streamable HTTP servers (e.g. Paper Desktop) answer a bare GET
+// with 404 instead; a routed HTTP response of any kind proves reachability,
+// so treat 404 as alive and let the real MCP client validate the endpoint.
+const HEALTHY_HTTP_CODES = new Set([200, 201, 202, 204, 301, 302, 303, 304, 307, 308, 400, 401, 403, 404, 405, 406]);
 const RECONNECT_STATUS_CODES = new Set([401, 403, 429, 503]);
 const FAILURE_PATTERNS = [
   { code: 401, pattern: /\b401\b|unauthori[sz]ed|auth(?:entication)?\s+(?:failed|expired|invalid)/i },
@@ -44,11 +48,29 @@ function envNumber(name, fallback) {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
+// Resolve the Claude profile directory the same way everywhere.
+//
+// Duplicated rather than imported on purpose: hooks ship in managed installs
+// that carry top-level `scripts/` without `scripts/lib/` (see #3259), so a
+// require into lib/ would make the hook unloadable there. `~` is expanded the
+// way `scripts/lib/agent-data-home.js` expands it, so a profile written as
+// `~/.claude-work` resolves to one place rather than two.
+function claudeConfigDir() {
+  const configured = process.env.CLAUDE_CONFIG_DIR;
+  const trimmed = configured ? String(configured).trim() : '';
+  if (!trimmed) return path.join(os.homedir(), '.claude');
+  if (trimmed.startsWith('~')) {
+    const remainder = trimmed.slice(1).replace(/^[/\\]+/, '');
+    return remainder ? path.join(os.homedir(), remainder) : os.homedir();
+  }
+  return path.resolve(trimmed);
+}
+
 function stateFilePath() {
   if (process.env.ECC_MCP_HEALTH_STATE_PATH) {
     return path.resolve(process.env.ECC_MCP_HEALTH_STATE_PATH);
   }
-  return path.join(os.homedir(), '.claude', 'mcp-health-cache.json');
+  return path.join(claudeConfigDir(), 'mcp-health-cache.json');
 }
 
 function configPaths() {
@@ -132,6 +154,16 @@ function safeParse(raw) {
 
 function extractMcpTarget(input) {
   const toolName = String(input.tool_name || input.name || '');
+  // A native MCP tool name identifies the dispatch target. A similarly named
+  // argument belongs to that tool's schema and may identify something else.
+  if (toolName.startsWith('mcp__')) {
+    const [server, ...segments] = toolName.slice(5).split('__');
+    if (server && segments.length > 0) {
+      return { server, tool: segments.join('__') };
+    }
+  }
+
+
   const explicitServer = input.server
     || input.mcp_server
     || input.tool_input?.server
@@ -151,19 +183,7 @@ function extractMcpTarget(input) {
     };
   }
 
-  if (!toolName.startsWith('mcp__')) {
-    return null;
-  }
-
-  const segments = toolName.slice(5).split('__');
-  if (segments.length < 2 || !segments[0]) {
-    return null;
-  }
-
-  return {
-    server: segments[0],
-    tool: segments.slice(1).join('__')
-  };
+  return null;
 }
 
 function extractMcpTargetFromRaw(raw) {
@@ -179,6 +199,12 @@ function extractMcpTargetFromRaw(raw) {
 }
 
 function resolveServerConfig(serverName) {
+  // SECURITY: serverName flows into env-var lookup and shell-adjacent paths.
+  // Reject anything outside a strict token so config-controlled names cannot
+  // inject shell metachars ($(..), backticks, ;) downstream.
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(String(serverName || ''))) {
+    return null;
+  }
   for (const filePath of configPaths()) {
     const data = readJsonFile(filePath);
     const server = data?.mcpServers?.[serverName]
@@ -196,6 +222,22 @@ function resolveServerConfig(serverName) {
   return null;
 }
 
+// Aliases are local names: two projects can both call different servers "db".
+// Hash configuration values (which can contain credentials) rather than storing
+// another copy in the cache. Cwd matters for relative commands and arguments.
+function serverCacheIdentity(resolvedConfig) {
+  return crypto.createHash('sha256').update(JSON.stringify([
+    process.cwd(),
+    resolvedConfig?.source || null,
+    resolvedConfig?.config || null
+  ])).digest('hex');
+}
+
+function matchingServerState(state, serverName, cacheIdentity) {
+  const previous = state.servers[serverName];
+  return previous?.cacheIdentity === cacheIdentity ? previous : {};
+}
+
 function markHealthy(state, serverName, now, details = {}) {
   state.servers[serverName] = {
     status: 'healthy',
@@ -210,14 +252,15 @@ function markHealthy(state, serverName, now, details = {}) {
   };
 }
 
-function markUnhealthy(state, serverName, now, failureCode, errorMessage) {
-  const previous = state.servers[serverName] || {};
+function markUnhealthy(state, serverName, now, failureCode, errorMessage, cacheIdentity) {
+  const previous = matchingServerState(state, serverName, cacheIdentity);
   const failureCount = Number(previous.failureCount || 0) + 1;
   const backoffBase = envNumber('ECC_MCP_HEALTH_BACKOFF_MS', DEFAULT_BACKOFF_MS);
   const nextRetryDelay = Math.min(backoffBase * (2 ** Math.max(failureCount - 1, 0)), MAX_BACKOFF_MS);
 
   state.servers[serverName] = {
     status: 'unhealthy',
+    cacheIdentity,
     checkedAt: now,
     expiresAt: now,
     failureCount,
@@ -303,9 +346,21 @@ function probeCommandServer(serverName, config) {
     const command = config.command;
     const args = Array.isArray(config.args) ? config.args.map(arg => String(arg)) : [];
     const timeoutMs = envNumber('ECC_MCP_HEALTH_TIMEOUT_MS', DEFAULT_TIMEOUT_MS);
+    // SECURITY: config.env comes from repo-committed MCP configs. Never let it
+    // override process-critical loader vars that turn into code execution
+    // (LD_PRELOAD, DYLD_*, NODE_OPTIONS, PATH tampering, etc.).
+    const BLOCKED_ENV_PREFIXES = ['LD_', 'DYLD_', 'NODE_OPTIONS', 'NODE_PATH', 'PATH', 'PYTHONPATH', 'RUBYLIB', 'PERL5LIB'];
+    const rawEnv = (config.env && typeof config.env === 'object' && !Array.isArray(config.env) ? config.env : {});
+    const safeConfigEnv = {};
+    for (const [k, v] of Object.entries(rawEnv)) {
+      if (BLOCKED_ENV_PREFIXES.some(p => String(k).toUpperCase().startsWith(p))) {
+        continue;
+      }
+      safeConfigEnv[k] = String(v);
+    }
     const mergedEnv = {
       ...process.env,
-      ...(config.env && typeof config.env === 'object' && !Array.isArray(config.env) ? config.env : {})
+      ...safeConfigEnv
     };
 
     let done = false;
@@ -337,6 +392,21 @@ function probeCommandServer(serverName, config) {
     // separators, or argument boundaries. Do not route such command strings
     // through shell mode.
     const UNSAFE_SHELL_CHARS = /[&|<>^%!()\s;]/;
+
+    // When spawning via cmd.exe (shell:true) on Windows, Node concatenates
+    // command + args WITHOUT quoting (DEP0190). An arg containing a space —
+    // such as a path under "C:\Program Files" — gets re-split by cmd.exe.
+    // Build a properly-quoted command line instead and pass it as a single
+    // string with no args array, so cmd.exe sees each token as one unit.
+    function quoteWin(token) {
+      // If the token has no characters that need quoting, return it as-is.
+      if (!/[\s"&|<>^%!();]/.test(token)) {
+        return token;
+      }
+      // Escape embedded double quotes by doubling them, then wrap in double
+      // quotes. cmd.exe uses "" as an escaped quote inside a quoted string.
+      return '"' + token.replace(/"/g, '""') + '"';
+    }
 
     function attempt(idx) {
       const tryCommand = candidates[idx];
@@ -375,12 +445,26 @@ function probeCommandServer(serverName, config) {
 
       let child;
       try {
-        child = spawn(tryCommand, args, {
-          env: mergedEnv,
-          cwd: process.cwd(),
-          stdio: ['pipe', 'ignore', 'pipe'],
-          shell: useShell
-        });
+        if (useShell) {
+          // Build a single quoted command line for cmd.exe. Passing an args
+          // array with shell:true causes Node to concatenate without quoting
+          // (DEP0190), which splits space-containing args (e.g. paths under
+          // "C:\Program Files") at every space boundary.
+          const quotedCmdline = [tryCommand, ...args].map(quoteWin).join(' ');
+          child = spawn(quotedCmdline, {
+            env: mergedEnv,
+            cwd: process.cwd(),
+            stdio: ['pipe', 'ignore', 'pipe'],
+            shell: true
+          });
+        } else {
+          child = spawn(tryCommand, args, {
+            env: mergedEnv,
+            cwd: process.cwd(),
+            stdio: ['pipe', 'ignore', 'pipe'],
+            shell: false
+          });
+        }
       } catch (error) {
         if ((error.code === 'ENOENT' || error.code === 'EINVAL') && !isLast) {
           retryNext();
@@ -483,6 +567,38 @@ function probeCommandServer(serverName, config) {
 async function probeServer(serverName, resolvedConfig) {
   const config = resolvedConfig.config;
 
+  // SECURITY: cloning a malicious repo must not auto-execute its MCP servers.
+  // Workspace configs (cwd .claude.json / .claude/settings.json) are untrusted
+  // by default; only probe them with explicit operator opt-in.
+  // Home configs (~/.claude.json) and explicit ECC_MCP_CONFIG_PATH remain allowed.
+  try {
+    const src = String(resolvedConfig.source || '');
+    const cwd = process.cwd();
+    const home = require('os').homedir();
+    const pathMod = require('path');
+    // A config file in the user's home directory (~/.claude.json or
+    // ~/.claude/settings.json) is always trusted regardless of cwd.
+    const isHomeSource = src === pathMod.join(home, '.claude.json')
+      || src === pathMod.join(home, '.claude', 'settings.json')
+      || src.startsWith(pathMod.join(home, '.claude') + pathMod.sep);
+    if (!isHomeSource) {
+      const isWorkspaceSource = src === pathMod.join(cwd, '.claude.json')
+        || src === pathMod.join(cwd, '.claude', 'settings.json')
+        || src.startsWith(cwd + pathMod.sep + '.claude' + pathMod.sep);
+      if (isWorkspaceSource && !/^(1|true|yes)$/i.test(String(process.env.ECC_MCP_ALLOW_WORKSPACE_PROBE || ''))) {
+        return {
+          ok: false,
+          failureCode: null,
+          reason: 'untrusted workspace MCP config skipped (set ECC_MCP_ALLOW_WORKSPACE_PROBE=1 to probe)',
+          source: resolvedConfig.source
+        };
+      }
+    }
+  } catch {
+    // Fail closed on path errors for workspace sources is handled below;
+    // continue to normal probing for non-workspace sources.
+  }
+
   if (config.type === 'http' || config.url) {
     const result = await requestHttp(config.url, config.headers || {}, envNumber('ECC_MCP_HEALTH_TIMEOUT_MS', DEFAULT_TIMEOUT_MS));
 
@@ -514,6 +630,15 @@ async function probeServer(serverName, resolvedConfig) {
 }
 
 function reconnectCommand(serverName) {
+  // SECURITY: reconnect commands are shell strings from env. Disabled by
+  // default; require explicit opt-in so a malicious .env/direnv cannot gain
+  // shell execution through this hook.
+  if (!/^(1|true|yes)$/i.test(String(process.env.ECC_MCP_RECONNECT_ALLOW || ''))) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(String(serverName || ''))) {
+    return null;
+  }
   const key = `ECC_MCP_RECONNECT_${String(serverName).toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
   const command = process.env[key] || process.env.ECC_MCP_RECONNECT_COMMAND || '';
   if (!command.trim()) {
@@ -531,8 +656,60 @@ function attemptReconnect(serverName) {
     return { attempted: false, success: false, reason: 'no reconnect command configured' };
   }
 
-  const result = spawnSync(command, {
-    shell: true,
+  // SECURITY: never run reconnect strings through a shell. Split on
+  // whitespace (no glob/expansion/substitution) and spawn directly.
+  // Supports single/double quotes for paths with spaces (e.g. node
+  // "/tmp/dir with space/reconnect.js"). No variable, command, tilde, or
+  // glob expansion is performed. {server} was already validated above.
+  function splitReconnectCommand(s) {
+    const parts = [];
+    let cur = '';
+    let quote = null;
+    let inToken = false;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (quote) {
+        if (ch === quote) {
+          quote = null;
+        } else if (ch === '\\' && quote === '"' && i + 1 < s.length && (s[i + 1] === '"' || s[i + 1] === '\\')) {
+          cur += s[i + 1];
+          i++;
+        } else {
+          cur += ch;
+        }
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+        inToken = true;
+      } else if (/\s/.test(ch)) {
+        if (inToken) {
+          parts.push(cur);
+          cur = '';
+          inToken = false;
+        }
+      } else {
+        cur += ch;
+        inToken = true;
+      }
+    }
+    if (quote) {
+      return null; // unbalanced quote
+    }
+    if (inToken) {
+      parts.push(cur);
+    }
+    return parts;
+  }
+  const parts = splitReconnectCommand(String(command).trim());
+  if (!parts || parts.length === 0) {
+    return { attempted: false, success: false, reason: 'invalid reconnect command' };
+  }
+  const [bin, ...argv] = parts;
+  if (/[&|<>^%!`$();]/.test(bin) || argv.some(a => /[`$]/.test(a))) {
+    return { attempted: false, success: false, reason: 'reconnect command contains unsafe characters' };
+  }
+
+  const result = spawnSync(bin, argv, {
+    shell: false,
     env: process.env,
     cwd: process.cwd(),
     encoding: 'utf8',
@@ -567,7 +744,9 @@ function emitLogs(logs) {
 async function handlePreToolUse(rawInput, input, target, statePathValue, now) {
   const logs = [];
   const state = loadState(statePathValue);
-  const previous = state.servers[target.server] || {};
+  const resolvedConfig = resolveServerConfig(target.server);
+  const cacheIdentity = serverCacheIdentity(resolvedConfig);
+  const previous = matchingServerState(state, target.server, cacheIdentity);
 
   if (previous.status === 'healthy' && Number(previous.expiresAt || 0) > now) {
     return { rawInput, exitCode: 0, logs };
@@ -580,7 +759,6 @@ async function handlePreToolUse(rawInput, input, target, statePathValue, now) {
     return { rawInput, exitCode: shouldFailOpen() ? 0 : 2, logs };
   }
 
-  const resolvedConfig = resolveServerConfig(target.server);
   if (!resolvedConfig) {
     logs.push(`[MCPHealthCheck] No MCP config found for ${target.server}; skipping preflight probe`);
     return { rawInput, exitCode: 0, logs };
@@ -588,7 +766,7 @@ async function handlePreToolUse(rawInput, input, target, statePathValue, now) {
 
   const probe = await probeServer(target.server, resolvedConfig);
   if (probe.ok) {
-    markHealthy(state, target.server, now, { source: resolvedConfig.source });
+    markHealthy(state, target.server, now, { source: resolvedConfig.source, cacheIdentity });
     saveState(statePathValue, state);
 
     if (previous.status === 'unhealthy') {
@@ -606,6 +784,7 @@ async function handlePreToolUse(rawInput, input, target, statePathValue, now) {
       if (reprobe.ok) {
         markHealthy(state, target.server, now, {
           source: resolvedConfig.source,
+          cacheIdentity,
           restoredBy: 'reconnect-command'
         });
         saveState(statePathValue, state);
@@ -616,7 +795,7 @@ async function handlePreToolUse(rawInput, input, target, statePathValue, now) {
     }
   }
 
-  markUnhealthy(state, target.server, now, probe.failureCode, probe.reason);
+  markUnhealthy(state, target.server, now, probe.failureCode, probe.reason, cacheIdentity);
   saveState(statePathValue, state);
 
   const reconnectSuffix = reconnect.attempted
@@ -639,7 +818,8 @@ async function handlePostToolUseFailure(rawInput, input, target, statePathValue,
   }
 
   const state = loadState(statePathValue);
-  markUnhealthy(state, target.server, now, failureCode, summary.slice(0, 500));
+  const cacheIdentity = serverCacheIdentity(resolveServerConfig(target.server));
+  markUnhealthy(state, target.server, now, failureCode, summary.slice(0, 500), cacheIdentity);
   saveState(statePathValue, state);
 
   logs.push(`[MCPHealthCheck] ${target.server} reported ${failureCode}; marking server unhealthy and attempting reconnect`);
@@ -670,6 +850,7 @@ async function handlePostToolUseFailure(rawInput, input, target, statePathValue,
   const refreshed = loadState(statePathValue);
   markHealthy(refreshed, target.server, now, {
     source: resolvedConfig.source,
+    cacheIdentity: serverCacheIdentity(resolvedConfig),
     restoredBy: 'post-failure-reconnect'
   });
   saveState(statePathValue, refreshed);

@@ -2,6 +2,7 @@
 'use strict';
 
 const { isHookEnabled } = require('../lib/hook-flags');
+const { readStdinRaw } = require('./hook-input');
 const {
   buildPreToolUseAdditionalContext,
   combineAdditionalContext,
@@ -72,21 +73,6 @@ const POST_BASH_HOOKS = [
   },
 ];
 
-function readStdinRaw() {
-  return new Promise(resolve => {
-    let raw = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', chunk => {
-      if (raw.length < MAX_STDIN) {
-        const remaining = MAX_STDIN - raw.length;
-        raw += chunk.substring(0, remaining);
-      }
-    });
-    process.stdin.on('end', () => resolve(raw));
-    process.stdin.on('error', () => resolve(raw));
-  });
-}
-
 function normalizeHookResult(previousRaw, output) {
   if (typeof output === 'string' || Buffer.isBuffer(output)) {
     return {
@@ -120,8 +106,35 @@ function normalizeHookResult(previousRaw, output) {
   };
 }
 
+/**
+ * True when hook stdout is a PreToolUse `deny` decision. GateGuard and other
+ * hooks deny by writing that JSON to stdout at exit code 0, so the dispatcher
+ * must recognise it as a decision rather than as pass-through output.
+ */
+function isPermissionDeny(raw) {
+  if (typeof raw !== 'string' || !raw.includes('permissionDecision')) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return Boolean(
+      parsed
+      && parsed.hookSpecificOutput
+      && parsed.hookSpecificOutput.permissionDecision === 'deny'
+    );
+  } catch {
+    return false;
+  }
+}
+
 function runHooks(rawInput, hooks) {
   let currentRaw = rawInput;
+  // Track whether a sub-hook deliberately produced stdout (a string or
+  // {stdout}) versus currentRaw still being the untouched input event.
+  // Echoing the unmodified input event back to stdout fails Claude Code's
+  // hook-output JSON schema validation ("(root): Invalid input"), so in the
+  // pass-through case we must emit nothing instead.
+  let rawModified = false;
   let stderr = '';
   let additionalContext = '';
 
@@ -132,6 +145,9 @@ function runHooks(rawInput, hooks) {
 
     try {
       const result = normalizeHookResult(currentRaw, hook.run(currentRaw));
+      if (result.raw !== currentRaw) {
+        rawModified = true;
+      }
       currentRaw = result.raw;
       if (result.stderr) {
         stderr += result.stderr.endsWith('\n') ? result.stderr : `${result.stderr}\n`;
@@ -139,8 +155,23 @@ function runHooks(rawInput, hooks) {
       if (result.additionalContext) {
         additionalContext = combineAdditionalContext(additionalContext, result.additionalContext);
       }
+      // A deny is a decision, not a note: stop here so neither a later hook
+      // nor an earlier hook's advisory additionalContext can replace it.
+      if (result.exitCode === 0 && rawModified && isPermissionDeny(currentRaw)) {
+        return {
+          output: currentRaw,
+          stderr,
+          additionalContext,
+          exitCode: 0,
+        };
+      }
       if (result.exitCode !== 0) {
-        return { output: currentRaw, stderr, additionalContext, exitCode: result.exitCode };
+        return {
+          output: rawModified ? currentRaw : '',
+          stderr,
+          additionalContext,
+          exitCode: result.exitCode,
+        };
       }
     } catch (error) {
       stderr += `[Hook] ${hook.id} failed: ${error.message}\n`;
@@ -150,7 +181,9 @@ function runHooks(rawInput, hooks) {
   return {
     output: additionalContext
       ? buildPreToolUseAdditionalContext(additionalContext)
-      : currentRaw,
+      : rawModified
+        ? currentRaw
+        : '',
     stderr,
     additionalContext,
     exitCode: 0,
@@ -167,7 +200,19 @@ function runPostBash(rawInput) {
 
 async function main() {
   const mode = process.argv[2];
-  const raw = await readStdinRaw();
+  // The shared reader also settles on close and on an idle deadline, so a
+  // parent that never closes stdin cannot hang the dispatcher (#3665).
+  const { raw, truncated } = await readStdinRaw(process.stdin, { maxStdin: MAX_STDIN });
+  if (truncated) {
+    // Safety hooks cannot inspect a partial request, so pre-Bash fails closed.
+    // Post-Bash has nothing left to block and must not echo a partial payload.
+    const blocking = mode !== 'post';
+    process.stderr.write(
+      `[Hook] incomplete stdin for bash-hook-dispatcher ${blocking ? 'pre' : 'post'}; ` +
+        (blocking ? 'blocking because safety checks require the complete request\n' : 'skipping post-Bash hooks\n')
+    );
+    process.exit(blocking ? 2 : 0);
+  }
 
   const result = mode === 'post'
     ? runPostBash(raw)

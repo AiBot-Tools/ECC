@@ -25,7 +25,7 @@ const UNSAFE_PATH_CHARS = /[&|<>^%!;`()$]/;
 
 const { findProjectRoot, detectFormatter, resolveFormatterBin } = require('../lib/resolve-formatter');
 
-const MAX_STDIN = 1024 * 1024; // 1MB limit
+const MAX_DIRECT_STDIN_BYTES = 16 * 1024 * 1024;
 
 /**
  * Core logic — exported so run-with-flags.js can call directly
@@ -39,7 +39,7 @@ function run(rawInput) {
     const input = JSON.parse(rawInput);
     const filePath = input.tool_input?.file_path;
 
-    if (filePath && /\.(ts|tsx|js|jsx)$/.test(filePath)) {
+    if (filePath && /\.(?:[cm]?[jt]s|[jt]sx)$/.test(filePath)) {
       try {
         const resolvedFilePath = path.resolve(filePath);
         const projectRoot = findProjectRoot(path.dirname(resolvedFilePath));
@@ -90,19 +90,28 @@ function run(rawInput) {
 // ── stdin entry point (backwards-compatible) ────────────────────
 if (require.main === module) {
   let data = '';
+  let stdinBytes = 0;
+  let oversized = false;
   process.stdin.setEncoding('utf8');
 
   process.stdin.on('data', chunk => {
-    if (data.length < MAX_STDIN) {
-      const remaining = MAX_STDIN - data.length;
-      data += chunk.substring(0, remaining);
+    if (oversized) return;
+    stdinBytes += Buffer.byteLength(chunk, 'utf8');
+    if (stdinBytes > MAX_DIRECT_STDIN_BYTES) {
+      data = '';
+      oversized = true;
+      return;
     }
+    data += chunk;
   });
 
   process.stdin.on('end', () => {
+    if (oversized) {
+      process.exit(0);
+      return;
+    }
     data = run(data);
-    process.stdout.write(data);
-    process.exit(0);
+    process.stdout.write(data, () => process.exit(0));
   });
 }
 

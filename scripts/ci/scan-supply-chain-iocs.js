@@ -414,6 +414,7 @@ function normalizeForMatch(value) {
 function isInSpecialConfigPath(filePath) {
   const normalized = normalizedPath(filePath);
   return /\/\.claude\//.test(normalized)
+    || /\/\.cursor\//.test(normalized)
     || /\/\.vscode\//.test(normalized)
     || /\/\.kiro\/settings\//.test(normalized)
     || /\/Library\/LaunchAgents\//.test(normalized)
@@ -458,12 +459,27 @@ function walkFiles(rootDir, files = []) {
   return files;
 }
 
+// Symbolic links are not followed: pnpm's top-level entries and workspace
+// packages are links, and following them could loop or leave the scan root.
+// pnpm keeps the real package directories in its virtual store instead,
+// node_modules/.pnpm/<id>/node_modules/<name>, which is walked directly.
+function walkPnpmVirtualStore(storeDir, files) {
+  for (const entry of fs.readdirSync(storeDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    walkNodeModules(path.join(storeDir, entry.name, 'node_modules'), files);
+  }
+}
+
 function walkNodeModules(nodeModulesDir, files) {
-  if (!fs.existsSync(nodeModulesDir)) return;
+  if (!fs.existsSync(nodeModulesDir) || !fs.lstatSync(nodeModulesDir).isDirectory()) return;
 
   for (const entry of fs.readdirSync(nodeModulesDir, { withFileTypes: true })) {
-    if (entry.name.startsWith('.')) continue;
     const fullPath = path.join(nodeModulesDir, entry.name);
+    if (entry.name === '.pnpm' && entry.isDirectory()) {
+      walkPnpmVirtualStore(fullPath, files);
+      continue;
+    }
+    if (entry.name.startsWith('.')) continue;
     if (entry.isDirectory()) {
       if (entry.name.startsWith('@')) {
         for (const scopedEntry of fs.readdirSync(fullPath, { withFileTypes: true })) {
@@ -490,6 +506,12 @@ function inspectPackageDir(packageDir, files) {
     if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
       files.push(candidate);
     }
+  }
+
+  // npm nests a dependency under its dependent when versions conflict.
+  const nestedNodeModules = path.join(packageDir, 'node_modules');
+  if (fs.existsSync(nestedNodeModules) && fs.lstatSync(nestedNodeModules).isDirectory()) {
+    walkNodeModules(nestedNodeModules, files);
   }
 }
 
@@ -661,21 +683,26 @@ function scanFile(filePath, rootDir, findings) {
 
   for (const indicator of CRITICAL_TEXT_INDICATORS) {
     const normalizedIndicator = normalizeForMatch(indicator);
-    let index = lowerText.indexOf(normalizedIndicator);
-    while (index !== -1) {
-      if (!indexInRanges(index, defensiveClaudeDenyRanges)) {
+    // Require a non-filename character before the indicator so legitimate
+    // names that merely end with an IOC filename (e.g. the stock Cursor hook
+    // `before-shell-execution.js` vs the payload `execution.js`) do not match.
+    const indicatorPattern = new RegExp(
+      `(?<![a-z0-9_-])${escapeRegExp(normalizedIndicator)}`,
+      'g',
+    );
+    let match;
+    while ((match = indicatorPattern.exec(lowerText)) !== null) {
+      if (!indexInRanges(match.index, defensiveClaudeDenyRanges)) {
         addFinding(
           findings,
           'critical',
           relativePath,
-          lineForIndex(text, index),
+          lineForIndex(text, match.index),
           indicator,
           'Known active supply-chain IOC is present',
         );
         break;
       }
-
-      index = lowerText.indexOf(normalizedIndicator, index + normalizedIndicator.length);
     }
   }
 

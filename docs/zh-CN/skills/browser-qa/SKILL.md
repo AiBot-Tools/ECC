@@ -1,3 +1,10 @@
+---
+name: browser-qa
+description: Automate visual testing and UI interaction verification using browser automation after deployment.
+metadata:
+  origin: ECC
+---
+
 # Browser QA — 自动化视觉测试与交互验证
 
 ## When to use
@@ -74,7 +81,7 @@
 ## 集成
 
 可与任意浏览器 MCP 配合：
-- `mChild__claude-in-chrome__*` 工具（推荐，直接使用你的真实 Chrome）
+- `mcp__claude-in-chrome__*` 工具（推荐，直接使用你的真实 Chrome）
 - 通过 `mcp__browserbase__*` 使用 Playwright
 - 直接运行 Puppeteer 脚本
 
